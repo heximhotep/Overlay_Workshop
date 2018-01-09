@@ -25,7 +25,7 @@ public class FlockController8 : MonoBehaviour
     
 
 
-    string path = @"C:\Users\User\Documents\nu_art\tin_drum\workshops\Flocking_Workshop\Assets\Scripts\kicking.bagel";
+    string path; 
     QAnimation animation;
     float timeFrame;
     ComputeShader jointComputer, flockComputer;
@@ -253,6 +253,7 @@ public class FlockController8 : MonoBehaviour
 
     void Start()
     {
+        path = Application.dataPath + @"\Scripts\Swim_Default.bagel";
         BagelLoader bagel = new BagelLoader(model);
         animation = bagel.LoadBagel(path);
         inverseBindXforms = model.bindposes;
