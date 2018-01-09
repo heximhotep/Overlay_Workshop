@@ -65,7 +65,7 @@ public class ClipInfo : EditorWindow
                         encodings.Add(frame);
                     }
                 }
-                string path = @"C:\Users\User\Documents\nu_art\tin_drum\workshops\Flocking_Workshop\Assets\Scripts\" + clip.name + ".bagel";
+                string path = Application.dataPath + @"\Scripts\" + clip.name + ".bagel";
                 System.IO.File.WriteAllLines(path, encodings.ToArray());
 
                 BagelLoader bagel = new BagelLoader(mesh);
@@ -76,11 +76,11 @@ public class ClipInfo : EditorWindow
                     Debug.Log(string.Format("Position: {0} \nRotation: {1} \nScale: {2}", sample.position.ToString(), sample.rotation.ToString(), sample.scale.ToString()));
                 }
                 var th = myAnim.GetType().TypeHandle;
-                unsafe
+                /*unsafe
                 {
                     long size = *(*(long**)&th + 1);
                     Debug.Log(size);
-                }
+                }*/
                 
             }
         }
