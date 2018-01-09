@@ -1,0 +1,276 @@
+﻿#pragma kernel CalculateTransforms
+
+#define AGENT_NUM 512
+
+struct TransformData
+{
+	float3 position;
+	float4 rotation;
+	float3 scale;
+};
+
+struct KeyFrame
+{
+	float time, value, inTangent, outTangent;
+};
+
+struct JointData
+{
+	int tXStartIdx, tXLength;
+	int tYStartIdx, tYLength;
+	int tZStartIdx, tZLength;
+	int rXStartIdx, rXLength;
+	int rYStartIdx, rYLength;
+	int rZStartIdx, rZLength;
+	int rWStartIdx, rWLength;
+	int sXStartIdx, sXLength;
+	int sYStartIdx, sYLength;
+	int sZStartIdx, sZLength;
+	int numChildren;
+	float4x4 bindXForm, inverseBindXForm;
+};
+
+StructuredBuffer<JointData> jointBuf;
+StructuredBuffer<KeyFrame> tXBuf;
+StructuredBuffer<KeyFrame> tYBuf;
+StructuredBuffer<KeyFrame> tZBuf;
+StructuredBuffer<KeyFrame> rXBuf;
+StructuredBuffer<KeyFrame> rYBuf;
+StructuredBuffer<KeyFrame> rZBuf;
+StructuredBuffer<KeyFrame> rWBuf;
+StructuredBuffer<KeyFrame> sXBuf;
+StructuredBuffer<KeyFrame> sYBuf;
+StructuredBuffer<KeyFrame> sZBuf;
+
+StructuredBuffer<int> hierarchyBuf;
+
+RWStructuredBuffer<float> times;
+
+globallycoherent RWStructuredBuffer<float4x4> jointXforms;
+
+globallycoherent RWStructuredBuffer<float4x4> debugBuf;
+
+int numJoints;
+
+float deltaTime;
+float animationLength;
+
+/*int main()
+{
+	int c, first, last, middle, n, search, array[100];
+
+	printf("Enter number of elements\n");
+	scanf("%d", &n);
+
+	printf("Enter %d integers\n", n);
+
+	for (c = 0; c < n; c++)
+		scanf("%d", &array[c]);
+
+	printf("Enter value to find\n");
+	scanf("%d", &search);
+
+	first = 0;
+	last = n - 1;
+	middle = (first + last) / 2;
+
+	while (first <= last) {
+		if (array[middle] < search)
+			first = middle + 1;
+		else if (array[middle] == search) {
+			printf("%d found at location %d.\n", search, middle + 1);
+			break;
+		}
+		else
+			last = middle - 1;
+
+		middle = (first + last) / 2;
+	}
+	if (first > last)
+		printf("Not found! %d is not present in the list.\n", search);
+
+	return 0;
+}*/
+
+float unityInterp(float t, KeyFrame keyframe0, KeyFrame keyframe1)
+{
+	float dt = keyframe1.time - keyframe0.time;
+
+	float m0 = keyframe0.outTangent * dt;
+	float m1 = keyframe1.inTangent * dt;
+
+	float t2 = t * t;
+	float t3 = t2 * t;
+
+	float a = 2 * t3 - 3 * t2 + 1;
+	float b = t3 - 2 * t2 + t;
+	float c = t3 - t2;
+	float d = -2 * t3 + 3 * t2;
+
+	return a * keyframe0.value + b * m0 + c * m1 + d * keyframe1.value;
+}
+
+float BinarySearchVal(StructuredBuffer<KeyFrame> frames, int baseIdx, int baseLen, float curTime)
+{
+	int first = baseIdx;
+	int last = first + baseLen - 1;
+	int middle = (first + last) / 2;
+
+	while (first <= last) {
+		if (frames[middle].time < curTime)
+			first = middle + 1;
+		else if (frames[middle].time == curTime)
+			return frames[middle].value;
+		else
+			last = middle - 1;
+
+		middle = (first + last) / 2;
+	}
+	int minIdx = middle;
+	int maxIdx = middle + 1;
+	KeyFrame minFrame = frames[minIdx];
+	KeyFrame maxFrame = frames[maxIdx];
+	float ratio = (curTime - minFrame.time) / (maxFrame.time - minFrame.time);
+	return lerp(minFrame.value, maxFrame.value, ratio);
+}
+
+
+
+float GetKeyAttribAt(int jointIdx, int attribIdx, float curTime)
+/*
+0: translate x
+1: translate y
+2: translate z
+3: rotate x
+4: rotate y
+5: rotate z
+6: rotate w
+7: scale x
+8: scale y
+9: scale z
+*/
+{
+	JointData indices = jointBuf[jointIdx];
+	switch (attribIdx)
+	{
+	case(0):
+		return BinarySearchVal(tXBuf, indices.tXStartIdx, indices.tXLength, curTime);
+		break;
+	case(1):
+		return BinarySearchVal(tYBuf, indices.tYStartIdx, indices.tYLength, curTime);
+		break;
+	case(2):
+		return BinarySearchVal(tZBuf, indices.tZStartIdx, indices.tZLength, curTime);
+		break;
+	case(3):
+		return BinarySearchVal(rXBuf, indices.rXStartIdx, indices.rXLength, curTime);
+		break;
+	case(4):
+		return BinarySearchVal(rYBuf, indices.rYStartIdx, indices.rYLength, curTime);
+		break;
+	case(5):
+		return BinarySearchVal(rZBuf, indices.rZStartIdx, indices.rZLength, curTime);
+		break;
+	case(6):
+		return BinarySearchVal(rWBuf, indices.rWStartIdx, indices.rWLength, curTime);
+		break;
+	case(7):
+		return BinarySearchVal(sXBuf, indices.sXStartIdx, indices.sXLength, curTime);
+		break;
+	case(8):
+		return BinarySearchVal(sYBuf, indices.sYStartIdx, indices.sYLength, curTime);
+		break;
+	case(9):
+		return BinarySearchVal(sZBuf, indices.sZStartIdx, indices.sZLength, curTime);
+		break;
+	}
+}
+
+int AddressOf(int jointIdx)
+{
+	int result = 0;
+	while (jointIdx > 0)
+	{
+		result += jointBuf[jointIdx - 1].numChildren + 1;
+		jointIdx = jointIdx - 1;
+	}
+	debugBuf[jointIdx]._m00 = result;
+	return result;
+}
+
+float4x4 TRS(float3 position, float4 rotation, float3 scale)
+{
+	float4x4 T = float4x4(
+		1, 0, 0, position.x,
+		0, 1, 0, position.y,
+		0, 0, 1, position.z,
+		0, 0, 0, 1);
+	float4x4 R = float4x4(
+		1 - 2 * rotation.y * rotation.y - 2 * rotation.z * rotation.z, 2 * rotation.x * rotation.y - 2 * rotation.z * rotation.w, 2 * rotation.x * rotation.z + 2 * rotation.y * rotation.w, 0,
+		2 * rotation.x * rotation.y + 2 * rotation.z * rotation.w, 1 - 2 * rotation.x * rotation.x - 2 * rotation.z * rotation.z, 2 * rotation.y * rotation.z - 2 * rotation.x * rotation.w, 0,
+		2 * rotation.x * rotation.z - 2 * rotation.y * rotation.w, 2 * rotation.y * rotation.z + 2 * rotation.x * rotation.w, 1 - 2 * rotation.x * rotation.x - 2 * rotation.y * rotation.y, 0,
+		0, 0, 0, 1);
+	float4x4 S = float4x4(
+		scale.x, 0, 0, 0,
+		0, scale.y, 0, 0,
+		0, 0, scale.z, 0,
+		0, 0, 0, 1);
+	return mul(T, mul(R, S));
+}
+
+float4x4 GetTransformAt(int jointIdx, float curTime)
+{
+	float3 position, scale;
+	float4 rotation;
+	position.x = GetKeyAttribAt(jointIdx, 0, curTime);
+	position.y = GetKeyAttribAt(jointIdx, 1, curTime);
+	position.z = GetKeyAttribAt(jointIdx, 2, curTime);
+	rotation.x = GetKeyAttribAt(jointIdx, 3, curTime);
+	rotation.y = GetKeyAttribAt(jointIdx, 4, curTime);
+	rotation.z = GetKeyAttribAt(jointIdx, 5, curTime);
+	rotation.w = GetKeyAttribAt(jointIdx, 6, curTime);
+	scale.x = GetKeyAttribAt(jointIdx, 7, curTime);
+	scale.y = GetKeyAttribAt(jointIdx, 8, curTime);
+	scale.z = GetKeyAttribAt(jointIdx, 9, curTime);
+
+	return TRS(position, rotation, scale);
+}
+
+void ApplyTransformation(int jointBaseIdx)
+{
+	for (int i = 0; i < numJoints; i++)
+	{
+		int baseIdx = AddressOf(i);
+		int numKids = hierarchyBuf[baseIdx];
+		for (int j = baseIdx + 1; j <= baseIdx + numKids; j++)
+		{
+			int childIdx = hierarchyBuf[j];
+			jointXforms[childIdx + jointBaseIdx] =  mul(jointXforms[i + jointBaseIdx] , jointXforms[childIdx + jointBaseIdx]);
+		}
+		
+	}
+	for (int i = 0; i < numJoints; i++)
+	{
+		jointXforms[i + jointBaseIdx] = mul(jointXforms[i + jointBaseIdx], jointBuf[i].inverseBindXForm);
+	}
+}
+
+[numthreads(13 ,1,1)]
+void CalculateTransforms (uint3 id : SV_DispatchThreadID)
+{
+	int idx = id.x;
+	int attribIdx = id.x % 10;
+	int jointIdx = idx % numJoints;
+	int timeId = idx / numJoints;
+	float _time = times[timeId];
+	jointXforms[id.x] = GetTransformAt(jointIdx, _time);
+	GroupMemoryBarrierWithGroupSync();
+	if (timeId < AGENT_NUM && jointIdx == 0 && attribIdx == 0)
+	{
+		ApplyTransformation(id.x);
+		times[timeId] = times[timeId] + deltaTime;
+		if (times[timeId] >= animationLength)
+			times[timeId] %= animationLength;
+	}
+}
+

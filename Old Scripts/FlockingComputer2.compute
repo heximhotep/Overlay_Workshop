@@ -1,0 +1,267 @@
+﻿#pragma kernel Update
+
+#define AGENT_NUM 4000
+#include "noiseSimplex.cginc"
+float noiseFactor;
+float centroidDistance, spacingDistance, headingDistance;
+float centroidWeight, headingWeight, spacingWeight;
+float maxSpeed, maxForce, _time, deltaTime;
+
+float3 anchorPosition;
+
+struct Range 
+{
+	int id0, id1;
+};
+
+struct Agent 
+{
+	float3 position, velocity;	
+};
+
+struct FlockDatum
+{
+	float3 centroidTotal, headingTotal, spacingTotal;
+	float centroidWeightTotal, headingWeightTotal, spacingWeightTotal;
+};
+
+int halfMatCount = AGENT_NUM * (AGENT_NUM - 1) / 2;
+
+RWStructuredBuffer<Range> ranges;
+RWStructuredBuffer<Agent> agents;
+RWStructuredBuffer<FlockDatum> flockData;
+groupshared int opCount;
+
+float centroidDist, headingDist, spacingDist;
+
+RWBuffer<float3> float3Vals;
+RWBuffer<float> floatVals;
+
+void parAddFloat3(int id, int count, out float3 result)
+{
+	//vals[id] = float3(0, 0, 0);
+	int i = 1;
+	int n = ceil(log2(count)) + 1;
+	while (i < n)
+	{
+		int threadCheck = id % (pow(2, i));
+		if (threadCheck == 0 && id + pow(2, i - 1) < count)
+		{
+			float3Vals[id] += float3Vals[id + pow(2, i - 1)];
+		}
+		i += 1;
+	}
+	AllMemoryBarrierWithGroupSync();
+	if (id == 0)
+		result = float3Vals[0];
+}
+
+void parAddFloat(int id, int count, out float result)
+{
+	//vals[id] = 0;
+	int i = 1;
+	int n = ceil(log2(count)) + 1;
+	while (i < n)
+	{
+		int threadCheck = id % (pow(2, i));
+		if (threadCheck == 0 && id + pow(2, i - 1) < count)
+		{
+			floatVals[id] += floatVals[id + pow(2, i - 1)];
+		}
+		AllMemoryBarrierWithGroupSync();
+		i++;
+	}
+	AllMemoryBarrierWithGroupSync();
+	if (id == 0)
+		result = floatVals[0];
+}
+
+float3 limitVec(float3 v, float l) 
+{
+	float al = length(v);
+	if (al > l) 
+		v = v * l / al;
+	return v;
+}
+
+float3 maxVec(float3 v, float l) 
+{ 
+	return v * l / length(v); 
+}
+
+
+[numthreads(100,1,1)]
+void Update (uint3 id : SV_DispatchThreadID)
+{
+	if (id.x == 0)
+		opCount = 0;
+	Range range = ranges[id.x];
+	Agent agent0 = agents[range.id0];
+	Agent agent1 = agents[range.id1];
+	float dist = length(agent0.position - agent1.position);
+	float3Vals[id.x] = float3(0, 0, 0);
+	floatVals[id.x] = 0;
+	//CHECK CENTROID DISTANCE
+	if (dist < centroidDist && opCount < 500)
+	{
+		int thisIdx;
+		InterlockedAdd(opCount, 1, thisIdx);
+		float thisWeight = centroidDist - dist;
+		float3Vals[thisIdx] = agent0.position * thisWeight;
+		floatVals[thisIdx] = thisWeight;
+	}
+	AllMemoryBarrierWithGroupSync();
+	parAddFloat3(id.x, opCount, flockData[range.id1].centroidTotal);
+	parAddFloat(id.x, opCount, flockData[range.id1].centroidWeightTotal);
+	if (id.x == 0)
+	{
+		if(opCount != 0)
+			flockData[range.id1].centroidTotal *= 1 / flockData[range.id1].centroidWeightTotal;
+		opCount = 0;
+	}
+	AllMemoryBarrierWithGroupSync();
+
+	float3Vals[id.x] = float3(0, 0, 0);
+	floatVals[id.x] = 0;
+	if (dist < centroidDist && opCount < 500)
+	{
+		int thisIdx;
+		float thisWeight = centroidDist - dist;
+		InterlockedAdd(opCount, 1, thisIdx);
+		float3Vals[thisIdx] = agent1.position * thisWeight;
+		floatVals[thisIdx] = thisWeight;
+	}
+	AllMemoryBarrierWithGroupSync();
+	parAddFloat3(id.x, opCount, flockData[range.id0].centroidTotal);
+	parAddFloat(id.x, opCount, flockData[range.id0].centroidWeightTotal);
+	if (id.x == 0)
+	{
+		if(opCount != 0)
+			flockData[range.id0].centroidTotal *= 1 / flockData[range.id0].centroidWeightTotal;	
+		opCount = 0;
+	}
+	AllMemoryBarrierWithGroupSync();
+	
+	float3Vals[id.x] = float3(0, 0, 0);
+	floatVals[id.x] = 0;
+
+	//CHECK HEADING DISTANCE
+	if (dist < headingDist && opCount < 400)
+	{
+		int thisIdx;
+		float thisWeight = headingDist - dist;
+		InterlockedAdd(opCount, 1, thisIdx);
+		float3Vals[thisIdx] = normalize(agent0.velocity) * thisWeight;
+		floatVals[thisIdx] = thisWeight;
+	}
+	AllMemoryBarrierWithGroupSync();
+	parAddFloat3(id.x, opCount, flockData[range.id1].headingTotal);
+	parAddFloat(id.x, opCount, flockData[range.id1].headingWeightTotal);
+	if (id.x == 0)
+	{
+		if (opCount != 0)
+			flockData[range.id1].headingTotal *= 1 / flockData[range.id1].headingWeightTotal;
+		opCount = 0;
+	}
+	AllMemoryBarrierWithGroupSync();
+
+	float3Vals[id.x] = float3(0, 0, 0);
+	if (dist < headingDist && opCount < 400)
+	{
+		int thisIdx;
+		float thisWeight = headingDist - dist;
+		InterlockedAdd(opCount, 1, thisIdx);
+		float3Vals[thisIdx] = normalize(agent1.velocity) * thisWeight;
+		floatVals[thisIdx] = thisWeight;
+	}
+	AllMemoryBarrierWithGroupSync();
+	parAddFloat3(id.x, opCount, flockData[range.id0].headingTotal);
+	parAddFloat(id.x, opCount, flockData[range.id0].headingWeightTotal);
+	if (id.x == 0)
+	{
+		if(opCount != 0)
+			flockData[range.id0].headingTotal *= 1 / flockData[range.id0].headingWeightTotal;
+		opCount = 0;
+	}
+	AllMemoryBarrierWithGroupSync();
+
+	//CHECK SPACING DISTANCE
+	if (dist < spacingDist && opCount < 400)
+	{
+		int thisIdx;
+		InterlockedAdd(opCount, 1, thisIdx);
+		float thisWeight = 1 / max(dist, 0.01);
+		float3Vals[thisIdx] = normalize(agent0.position - agent1.position) * thisWeight;
+		floatVals[thisIdx] = thisWeight;
+	}
+	AllMemoryBarrierWithGroupSync();
+	parAddFloat3(id.x, opCount, flockData[range.id1].spacingTotal);
+	parAddFloat(id.x, opCount, flockData[range.id1].spacingWeightTotal);
+	if (id.x == 0)
+	{
+		if(opCount != 0)
+			flockData[range.id1].spacingTotal *= 1 / flockData[range.id1].spacingWeightTotal;
+		opCount = 0;
+	}
+	AllMemoryBarrierWithGroupSync();
+
+	float3Vals[id.x] = float3(0, 0, 0);
+	if (dist < spacingDist && opCount < 400)
+	{
+		int thisIdx;
+		InterlockedAdd(opCount, 1, thisIdx);
+		float thisWeight = 1 / max(dist, 0.01);
+		float3Vals[thisIdx] = normalize(agent1.position - agent0.position) * thisWeight;
+		floatVals[thisIdx] = thisWeight;
+	}
+	AllMemoryBarrierWithGroupSync();
+	parAddFloat3(id.x, opCount, flockData[range.id0].spacingTotal);
+	parAddFloat(id.x, opCount, flockData[range.id0].spacingWeightTotal);
+	if (id.x == 0)
+	{
+		if(opCount != 0)
+			flockData[range.id0].spacingTotal *= 1 / flockData[range.id0].spacingWeightTotal;
+		opCount = 0;
+	}
+	AllMemoryBarrierWithGroupSync();
+	if (id.x < AGENT_NUM)
+	{
+		Agent agent = agents[id.x];
+		FlockDatum data = flockData[id.x];
+
+		float3 centroidSum = float3(0, 0, 0);
+		if (length(data.centroidTotal) != 0)
+		{
+			centroidSum = normalize(data.centroidTotal - agent.position) * maxSpeed - agent.velocity;
+			centroidSum = limitVec(centroidSum, maxForce);
+		}
+		
+		float3 headingSum = float3(0, 0, 0);
+		if (length(data.headingTotal) != 0)
+		{
+			headingSum = normalize(data.headingTotal) * maxSpeed - agent.velocity;
+			headingSum = limitVec(headingSum, maxForce);
+		}
+					
+		float3 spacingSum = float3(0, 0, 0);
+		if (length(data.spacingTotal) != 0)
+		{
+			spacingSum = normalize(data.spacingTotal) * maxSpeed - agent.velocity;
+			spacingSum = limitVec(spacingSum, maxForce);
+		}
+
+		float3 anchorOffset = anchorPosition - agent.position;
+
+		float3 acceleration = centroidSum * centroidWeight + headingSum * headingWeight + spacingSum * spacingWeight;
+		if (length(anchorOffset) > 5)
+			acceleration += anchorOffset;
+		acceleration = limitVec(acceleration, maxForce) * deltaTime;
+		float noiseX = snoise(float2(agent.position.x, _time / 20) * noiseFactor) / 40;
+		float noiseY = snoise(float2(agent.position.y, _time / 20 + 5000) * noiseFactor) / 40;
+		float noiseZ = snoise(float2(agent.position.z, _time / 20 + 10000) * noiseFactor) / 40;
+		agent.velocity += (acceleration + float3(noiseX, noiseY, noiseZ)) * deltaTime;
+		agent.velocity = limitVec(agent.velocity, maxSpeed);
+		agent.position += agent.velocity;
+		agents[id.x] = agent;
+	}
+}
