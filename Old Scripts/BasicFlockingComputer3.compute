@@ -1,0 +1,26 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel UpdateAgents
+
+struct Agent{
+	float3 pos;
+	float3 vel;
+	float3 acc;
+};
+
+RWStructuredBuffer<Agent> AgentBuffer;
+
+float maxVel;
+float maxAcc;
+
+[numthreads(10,1,1)]
+void UpdateAgents (uint3 id : SV_DispatchThreadID)
+{
+	Agent agent = AgentBuffer[id.x];
+	if(length(agent.acc) > maxAcc)
+		agent.acc = normalize(agent.acc) * maxAcc;
+	agent.vel += agent.acc;
+	if(length(agent.vel) > maxVel)
+		agent.vel = normalize(agent.vel) * maxVel;
+	agent.pos += agent.vel;
+	AgentBuffer[id.x] = agent;
+}

@@ -1,0 +1,346 @@
+﻿CGPROGRAM
+
+#pragma kernel TimeStep
+
+#define AGENT_NUM 20
+#define HALFMAT_COUNT (AGENT_NUM * (AGENT_NUM - 1) / 2)
+#define MAX_OPS 8
+
+//#include "noiseSimplex.cginc"
+float noiseFactor, noiseMagnitude;
+float centroidThreshold, spacingThreshold, headingThreshold;
+float centroidWeight, headingWeight, spacingWeight;
+float maxSpeed, maxForce, _time, deltaTime;
+int anchorCount;
+
+//ENCODINGS FROM NOTED STRUCTS INTO FLOAT4X4
+/*
+---
+*/
+struct Range
+{
+	int id0, id1;
+};
+/*
+we smush 8 of these pairs together thusly:
+float4x4 Range(id00, id01, id10, id11,
+			   id20, id21, id30, id31,
+			   id40, id41, id50, id51,
+			   id60, id61, id70, id71)
+we thus access each pair by RangeBuf[id.x / 8], then checking
+which fields to get by using modulo
+---
+*/
+struct Agent
+{
+	float3 position, velocity;
+};
+/*
+we smush 2 agents into each matrix thusly:
+float4x4 Agent(pos0.x, pos0.y, pos0.z, 0,
+			   vel0.x, vel0.y, vel0.z, 0,
+			   pos1.x, pos1.y, pos1.z, 0,
+			   vel1.x, vel1.y, vel1.z, 0)
+we then access each agent by AgentBuf[id.x / 2], then checking
+which fields using modulo
+---
+*/
+struct FlockDatum
+{
+	float4 centroidTotal, headingTotal, spacingTotal;
+	int centroidOpCount, headingOpCount, spacingOpCount;
+};
+/*
+we have one matrix per FlockDatum:
+float4x4 FlockDatum(cTot.x, cTot.y, cTot.z, cWgt,
+				    hTot.x, hTot.y, hTot.z, hWgt,
+					sTot.x, sTot.y, sTot.z, sWgt,
+					cOpCnt, hOpCnt, sOpCnt, 0)
+*/
+StructuredBuffer<float4x4> RangeBuf;
+globallycoherent RWStructuredBuffer<float4x4> AgentBuf;
+globallycoherent RWStructuredBuffer<FlockDatum> FlockDataBuf;
+globallycoherent RWBuffer<float4> ParAddBuf;
+globallycoherent RWStructuredBuffer<float4x4> XFormBuf;
+
+/*void Mat2FlockDatum(uint idx, out FlockDatum result)
+{
+	float4x4 datum = FlockDataBuf[idx];
+	result.centroidTotal = float4(datum._m00, datum._m10, datum._m20, datum._m30);
+	result.headingTotal = float4(datum._m01, datum._m11, datum._m21, datum._m31);
+	result.spacingTotal = float4(datum._m02, datum._m12, datum._m22, datum._m32);
+	result.centroidOpCount = datum._m03;
+	result.headingOpCount = datum._m13;
+	result.spacingOpCount = datum._m23;
+}*/
+
+void Mat2Range(uint idx, out Range result)
+{
+	uint matIdx = idx / 8;
+	uint locIdx = idx % 8;
+	float4x4 data = RangeBuf[matIdx];
+	switch (locIdx)
+	{
+	case(0):
+		result.id0 = (int)data._m00;
+		result.id1 = (int)data._m10;
+		break;
+	case(1):
+		result.id0 = (int)data._m20;
+		result.id1 = (int)data._m30;
+		break;
+	case(2):
+		result.id0 = (int)data._m01;
+		result.id1 = (int)data._m11;
+		break;
+	case(3):
+		result.id0 = (int)data._m21;
+		result.id1 = (int)data._m31;
+		break;
+	case(4):
+		result.id0 = (int)data._m02;
+		result.id1 = (int)data._m12;
+		break;
+	case(5):
+		result.id0 = (int)data._m22;
+		result.id1 = (int)data._m32;
+		break;
+	case(6):
+		result.id0 = (int)data._m03;
+		result.id1 = (int)data._m13;
+		break;
+	case(7):
+		result.id0 = (int)data._m23;
+		result.id1 = (int)data._m33;
+		break;
+	}
+}
+
+void Mat2Agent(uint idx, out Agent result)
+{
+	uint matIdx = idx / 2;
+	uint locIdx = idx % 2;
+	float4x4 data = AgentBuf[matIdx];
+	result.position = locIdx == 0 ? data._m00_m10_m20 : data._m02_m12_m22;
+	result.velocity = locIdx == 0 ? data._m01_m11_m21 : data._m03_m13_m23;
+}
+
+void Agent2Mat(uint idx, Agent agent)
+{
+	uint matIdx = idx / 2;
+	uint locIdx = idx % 2;
+	if (locIdx == 0)
+	{
+		AgentBuf[matIdx]._m00_m10_m20 = agent.position;
+		AgentBuf[matIdx]._m01_m11_m21 = agent.velocity;
+	}
+	else
+	{
+		AgentBuf[matIdx]._m02_m12_m22 = agent.position;
+		AgentBuf[matIdx]._m03_m13_m23 = agent.velocity;
+	}
+}
+
+
+
+void ParAdd(uint id, out float4 result)
+{
+	uint i = 1;
+	uint n = ceil(log2(MAX_OPS)) + 1;
+	[unroll(3)]
+	while (i < n)
+	{
+		int threadCheck = id % (pow(2, i));
+		bool canAdd = threadCheck == 0 && id + pow(2, i - 1) < MAX_OPS * AGENT_NUM;
+		if (canAdd)
+			ParAddBuf[id] += ParAddBuf[id + pow(2, i - 1)];
+		AllMemoryBarrierWithGroupSync();
+		i += 1;
+	}
+	AllMemoryBarrierWithGroupSync();
+	bool canReturn = id % MAX_OPS == 0 && id < MAX_OPS * AGENT_NUM;
+	if (canReturn)
+		result = ParAddBuf[id];
+}
+
+float3 limitVec(float3 v, float l)
+{
+	float al = length(v);
+	if (al > l)
+		v = v * l / al;
+	return v;
+}
+
+float3 maxVec(float3 v, float l)
+{
+	return v * l / length(v);
+}
+
+[numthreads(16, 1, 1)]
+void TimeStep (uint3 id : SV_DispatchThreadID)
+{
+	/*if (id.x < AGENT_NUM)
+	{
+		FlockDataBuf[id.x] = float4x4(0, 0, 0, 0,
+									  0, 0, 0, 0,
+									  0, 0, 0, 0,
+									  0, 0, 0, 0);
+	}*/
+
+	Range range;
+	Mat2Range(id.x, range);
+	Agent agent0;
+	Mat2Agent(range.id0, agent0);
+	Agent agent1; 
+	Mat2Agent(range.id1, agent1);
+	float dist = abs(agent0.position - agent1.position);
+	ParAddBuf[id.x] = float4(0, 0, 0, 0);
+	
+	//CHECK CENTROID DISTANCE
+	bool addToCentroid0 = FlockDataBuf[range.id0].centroidOpCount < MAX_OPS && dist < centroidThreshold;
+	bool addToCentroid1 = FlockDataBuf[range.id1].centroidOpCount < MAX_OPS && dist < centroidThreshold;
+	if (addToCentroid0)
+	{
+		int thisIdx;
+		InterlockedAdd((int)FlockDataBuf[range.id0].centroidOpCount, 1, thisIdx);
+		ParAddBuf[MAX_OPS * range.id0 + thisIdx] = float4(agent1.position * dist, dist);
+	}
+	if (addToCentroid1)
+	{
+		int thisIdx;
+		InterlockedAdd((int)FlockDataBuf[range.id1].centroidOpCount, 1, thisIdx);
+		ParAddBuf[MAX_OPS * range.id1 + thisIdx] = float4(agent0.position * dist, dist);
+	}
+	AllMemoryBarrierWithGroupSync();
+	int targetIdx = id.x / MAX_OPS < AGENT_NUM ? id.x / MAX_OPS : 0;
+	ParAdd(id.x, FlockDataBuf[targetIdx].centroidTotal);
+	AllMemoryBarrierWithGroupSync();
+	if (id.x < MAX_OPS * AGENT_NUM)
+		ParAddBuf[id.x] = float4(0, 0, 0, 0);
+
+	//CHECK HEADING DISTANCE
+	bool addToHeading0 = FlockDataBuf[range.id0].headingOpCount < MAX_OPS && dist < headingThreshold;
+	bool addToHeading1 = FlockDataBuf[range.id1].headingOpCount < MAX_OPS && dist < headingThreshold;
+	if (addToHeading0)
+	{
+		int thisIdx;
+		InterlockedAdd((int)FlockDataBuf[range.id0].headingOpCount, 1, thisIdx);
+		ParAddBuf[MAX_OPS * range.id0 + thisIdx] = float4(agent1.velocity * dist, dist);
+	}
+	if (addToHeading1)
+	{
+		int thisIdx;
+		InterlockedAdd((int)FlockDataBuf[range.id1].headingOpCount, 1, thisIdx);
+		ParAddBuf[MAX_OPS * range.id1 + thisIdx] = float4(agent0.velocity * dist, dist);
+	}
+	AllMemoryBarrierWithGroupSync();
+	ParAdd(id.x, FlockDataBuf[targetIdx].headingTotal);
+	AllMemoryBarrierWithGroupSync();
+	if (id.x < MAX_OPS * AGENT_NUM)
+		ParAddBuf[id.x] = float4(0, 0, 0, 0);
+
+	//CHECK SPACING DISTANCE
+	bool addToSpacing0 = FlockDataBuf[range.id0].spacingOpCount < MAX_OPS && dist < spacingThreshold;
+	bool addToSpacing1 = FlockDataBuf[range.id1].spacingOpCount < MAX_OPS && dist < spacingThreshold;
+	if (addToSpacing0)
+	{
+		int thisIdx;
+		InterlockedAdd(FlockDataBuf[range.id0].spacingOpCount, 1, thisIdx);
+		float weight = spacingThreshold - dist;
+		ParAddBuf[MAX_OPS * range.id0 + thisIdx] = float4((agent0.position - agent1.position) * weight, weight);
+	}
+	if (addToSpacing1)
+	{
+		int thisIdx;
+		InterlockedAdd(FlockDataBuf[range.id1].spacingOpCount, 1, thisIdx);
+		float weight = spacingThreshold - dist;
+		ParAddBuf[MAX_OPS * range.id1 + thisIdx] = float4((agent1.position - agent0.position) * weight, weight);
+	}
+	AllMemoryBarrierWithGroupSync();
+	ParAdd(id.x, FlockDataBuf[targetIdx].spacingTotal);
+	AllMemoryBarrierWithGroupSync();
+
+	int currentIdx = id.x < AGENT_NUM ? id.x : 0;
+	Agent agent;
+	Mat2Agent(currentIdx, agent);
+	FlockDatum data = FlockDataBuf[currentIdx];
+	float3 centroidSum = float3(0, 0, 0);
+	if (data.centroidTotal.w != 0)
+	{
+		centroidSum = data.centroidTotal.xyz * 1 / data.centroidTotal.w;
+		centroidSum = normalize(centroidSum - agent.position) * maxSpeed;
+		centroidSum = limitVec(centroidSum, maxForce);
+	}
+
+	float3 headingSum = float3(0, 0, 0);
+	if (data.headingTotal.w != 0)
+	{
+		headingSum = data.headingTotal.xyz * 1 / data.headingTotal.w;
+		headingSum = normalize(headingSum) * maxSpeed;
+		headingSum = limitVec(headingSum, maxForce);
+	}
+
+	float3 spacingSum = float3(0, 0, 0);
+	if (data.spacingTotal.w != 0)
+	{
+		spacingSum = data.spacingTotal.xyz * 1 / data.spacingTotal.w;
+		spacingSum = normalize(spacingSum) * maxSpeed;
+		spacingSum = limitVec(spacingSum, maxForce);
+	}
+
+		
+
+	float3 acceleration = centroidSum * centroidWeight + headingSum * headingWeight + spacingSum * spacingWeight;
+	/*
+	for (int i = 0; i < anchorCount; i++)
+	{
+		float3 anchorOffset = (AnchorBuf[i].xyz - agent.position);
+		if (length(anchorOffset) > 25)
+			acceleration += anchorOffset * AnchorBuf[i].w;
+	}
+	*/
+
+	/*
+	float noiseX = snoise(float4(agent.position, _time / 20) * noiseFactor) * noiseMagnitude;
+	float noiseY = snoise(float4(agent.position, _time / 20 + 5000) * noiseFactor) * noiseMagnitude;
+	float noiseZ = snoise(float4(agent.position, _time / 20 + 10000) * noiseFactor) * noiseMagnitude;
+	*/
+	acceleration = limitVec(acceleration, maxForce) * deltaTime;
+	bool validAcceleration = id.x < AGENT_NUM && !isnan(length(acceleration));
+	if (validAcceleration)
+	{
+		agent.velocity += acceleration;
+		agent.velocity = limitVec(agent.velocity, maxSpeed);
+		agent.position += agent.velocity * deltaTime;
+		Agent2Mat(id.x, agent);
+	}
+	else
+	{
+		ParAddBuf[id.x] = float4(acceleration, 0);
+	}
+	//build transformation matrix
+	float3 up = float3(0, 1, 0);
+	float3 dir = normalize(agent.velocity);
+	float3 pos = agent.position;
+
+	float3 xaxis = normalize(cross(up, dir));
+	float3 yaxis = normalize(cross(dir, xaxis));
+	xaxis = xaxis;
+	yaxis = yaxis;
+	dir = dir;
+	/*float4x4 result = float4x4(xaxis.x, xaxis.y, xaxis.z, pos.x,
+	yaxis.x, yaxis.y, yaxis.z, pos.y,
+	dir.x,   dir.y,   dir.z, pos.z,
+	0,       0,       0,     1 );*/
+	float4x4 result = float4x4(xaxis.x, yaxis.x, dir.x, pos.x,
+							   xaxis.y, yaxis.y, dir.y, pos.y,
+							   xaxis.z, yaxis.z, dir.z, pos.z,
+								     0,       0,     0,     1);
+	bool validMat = id.x < AGENT_NUM && isfinite(determinant(result)) && determinant(result) > 0;
+	if (validMat)
+	{
+		XFormBuf[id.x] = result;
+	}
+}
+
+ENDCG

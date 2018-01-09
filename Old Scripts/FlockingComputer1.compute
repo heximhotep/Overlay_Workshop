@@ -1,0 +1,35 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Update
+
+struct Agent{
+	float3 position;
+	float3 velocity;
+	float value;
+};
+
+struct Range{
+	int id0;
+	int id1;
+	float dist;
+};
+
+RWStructuredBuffer<Agent> AgentBuf;
+RWStructuredBuffer<Range> RangeBuf;
+int FlockSize;
+int halfMatCount;
+
+[numthreads(100,1,1)]
+void Update (uint3 id : SV_DispatchThreadID)
+{
+	if(id.x < halfMatCount)
+	{
+		Range thisRange = RangeBuf[id.x];
+		Agent agent0 = AgentBuf[thisRange.id0];
+		Agent agent1 = AgentBuf[thisRange.id1];
+		thisRange.dist = length(agent0.position - agent1.position);
+		RangeBuf[id.x] = thisRange;
+	}
+
+	Agent agent = AgentBuf[id.x];
+
+}

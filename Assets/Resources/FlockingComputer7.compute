@@ -1,0 +1,213 @@
+﻿#pragma kernel CheckRanges
+#pragma kernel TriParAdd
+#pragma kernel CalculateWeightedAverages
+
+#define AGENT_NUM 256
+
+struct Agent
+{
+	float3 position, velocity;
+};
+
+struct FlockDatum
+{
+	float4 centroidTotal, headingTotal, spacingTotal, filler;
+};
+
+RWStructuredBuffer<float4x4> AgentBuf;
+RWStructuredBuffer<float4x4> DebugBuf;
+RWStructuredBuffer<float4x4> XFormBuf;
+RWStructuredBuffer<FlockDatum> FDataBuf;
+RWStructuredBuffer<float4> CentroidParAddBuf, HeadingParAddBuf, SpacingParAddBuf;
+
+float3 anchorPoint;
+float anchorDistance, anchorAttractionWeight;
+
+float centroidThreshold, headingThreshold, spacingThreshold;
+float centroidWeight, headingWeight, spacingWeight;
+float maxSpeed, maxForce;
+float _time, deltaTime;
+
+inline void Mat2Agent(uint idx, out Agent result)
+{
+	uint matIdx = idx / 2;
+	uint locIdx = idx % 2;
+	float4x4 data = AgentBuf[matIdx];
+	result.position = locIdx == 0 ? data._m00_m10_m20 : data._m02_m12_m22;
+	result.velocity = locIdx == 0 ? data._m01_m11_m21 : data._m03_m13_m23;
+}
+
+inline void Agent2Mat(uint idx, Agent agent)
+{
+	uint matIdx = idx / 2;
+	uint locIdx = idx % 2;
+	if (locIdx == 0)
+	{
+		AgentBuf[matIdx]._m00_m10_m20 = agent.position;
+		AgentBuf[matIdx]._m01_m11_m21 = agent.velocity;
+	}
+	else
+	{
+		AgentBuf[matIdx]._m02_m12_m22 = agent.position;
+		AgentBuf[matIdx]._m03_m13_m23 = agent.velocity;
+	}
+}
+
+float3 limitVec(float3 v, float l)
+{
+	float al = length(v);
+	if (al > l)
+		v = v * l / al;
+	return v;
+}
+
+void ClearDataBuf(uint groupnum)
+{
+	FlockDatum datum = FDataBuf[groupnum];
+	datum.centroidTotal = float4(0, 0, 0, 0);
+	datum.headingTotal = float4(0, 0, 0, 0);
+	datum.spacingTotal = float4(0, 0, 0, 0);
+	FDataBuf[groupnum] = datum;
+}
+
+[numthreads(AGENT_NUM, 1, 1)]
+void CalculateWeightedAverages (uint3 id : SV_GroupThreadID)
+{
+	float3 centroidFactor = float3(0, 0, 0), 
+			headingFactor = float3(0, 0, 0), 
+			spacingFactor = float3(0, 0, 0);
+	float3 acceleration = float3(0, 0, 0);
+	Agent me;
+	Mat2Agent(id.x, me);
+	float4 ctotal, htotal, stotal;
+	ctotal = FDataBuf[id.x].centroidTotal;
+	htotal = FDataBuf[id.x].headingTotal;
+	stotal = FDataBuf[id.x].spacingTotal;
+
+	if (ctotal.w != 0 && !isnan(ctotal.w))
+	{
+		centroidFactor = ctotal.xyz * 1 / ctotal.w;
+		centroidFactor = normalize(centroidFactor - me.position) * maxSpeed;
+	}
+	if (htotal.w != 0 && !isnan(htotal.w))
+	{
+		headingFactor = htotal.xyz * 1 / htotal.w;
+		headingFactor = normalize(headingFactor) * maxSpeed;
+	}
+	if (stotal.w != 0 && !isnan(stotal.w))
+	{
+		spacingFactor = stotal.xyz * 1 / stotal.w;
+		spacingFactor = normalize(spacingFactor) * maxSpeed;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	acceleration = centroidFactor * centroidWeight +
+		headingFactor * headingWeight +
+		spacingFactor * spacingWeight;
+
+	if (length(me.position - anchorPoint) > anchorDistance)
+	{
+		acceleration += (anchorPoint - me.position) * anchorAttractionWeight;
+	}
+			
+	if (!isnan(length(acceleration)))
+	{
+		me.velocity += limitVec(acceleration, maxForce) * deltaTime;
+		me.velocity = limitVec(me.velocity, maxSpeed);
+		me.position += me.velocity * deltaTime;
+		Agent2Mat(id.x, me);
+	}
+
+		
+
+	float3 pos = me.position;
+	float3 dir = normalize(me.velocity);
+	float3 up = float3(0, 1, 0);
+	float3 xaxis = normalize(cross(up, dir));
+	float3 yaxis = normalize(cross(dir, xaxis));
+
+	float4x4 result = float4x4(xaxis.x, yaxis.x, dir.x, pos.x,
+		xaxis.y, yaxis.y, dir.y, pos.y,
+		xaxis.z, yaxis.z, dir.z, pos.z,
+		0, 0, 0, 1);
+
+	XFormBuf[id.x] = result;
+	ClearDataBuf(id.x);
+}
+
+[numthreads(AGENT_NUM, 1, 1)]
+void CheckRanges (uint3 myID : SV_GroupID, uint3 otherID : SV_GroupThreadID)
+{
+	uint myIdx = myID.x;
+	uint bufferIdx = otherID.y;
+	uint otherIdx = otherID.x;
+	Agent me, other;
+	Mat2Agent(myIdx, me);
+	Mat2Agent(otherIdx, other);
+
+	float3 offset = me.position - other.position;
+	float dist = abs(length(offset));
+	
+	bool notSame = myIdx != otherIdx;
+
+	bool inCRange, inHRange, inSRange;
+	inCRange = notSame && dist < centroidThreshold;
+	inHRange = notSame && dist < headingThreshold;
+	inSRange = notSame && dist < spacingThreshold;
+	
+	float weight;
+		
+	if (inCRange)
+	{
+		weight = sqrt(centroidThreshold - dist);
+		CentroidParAddBuf[(myIdx * AGENT_NUM + otherIdx)] = float4(other.position * weight, weight);
+	}
+	if (inHRange)
+	{
+		weight = sqrt(headingThreshold - dist);
+		HeadingParAddBuf[(myIdx * AGENT_NUM + otherIdx)] = float4(other.velocity * weight, weight);
+	}
+	if (inSRange)
+	{
+		weight = sqrt(spacingThreshold - dist);
+		SpacingParAddBuf[(myIdx * AGENT_NUM + otherIdx)] = float4(offset * weight, weight);
+	}
+
+}
+
+[numthreads(AGENT_NUM, 1, 1)]
+void TriParAdd(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
+{
+	uint groupOffset = gid.x * AGENT_NUM;
+	uint i = 1;
+	uint n = ceil(log2(AGENT_NUM)) + 1;
+	[unroll((int)ceil(log2(AGENT_NUM)))]
+	while (i < n)
+	{
+		int threadCheck = tid.x % pow(2, i);
+
+		bool canAdd = threadCheck == 0 && tid.x + pow(2, i - 1) < AGENT_NUM;
+
+		if (canAdd)
+		{
+			CentroidParAddBuf[groupOffset + tid.x] += CentroidParAddBuf[groupOffset + tid.x + pow(2, i - 1)];
+			HeadingParAddBuf[groupOffset + tid.x] += HeadingParAddBuf[groupOffset + tid.x + pow(2, i - 1)];
+			SpacingParAddBuf[groupOffset + tid.x] += SpacingParAddBuf[groupOffset + tid.x + pow(2, i - 1)];
+		}
+		GroupMemoryBarrierWithGroupSync();
+		i += 1;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (tid.x == 0)
+	{
+		FDataBuf[gid.x].centroidTotal = CentroidParAddBuf[groupOffset + tid.x];
+		FDataBuf[gid.x].headingTotal = HeadingParAddBuf[groupOffset + tid.x];
+		FDataBuf[gid.x].spacingTotal = SpacingParAddBuf[groupOffset + tid.x];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	CentroidParAddBuf[groupOffset + tid.x] = float4(0, 0, 0, 0);
+	HeadingParAddBuf[groupOffset + tid.x] = float4(0, 0, 0, 0);
+	SpacingParAddBuf[groupOffset + tid.x] = float4(0, 0, 0, 0);
+}
+
+

@@ -1,0 +1,47 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+struct instanceData
+{
+	float3 position, direction, up;
+};
+
+struct outputData
+{
+	float4x4 transformationMat;
+};
+
+RWStructuredBuffer<instanceData> instanceBuf;
+RWStructuredBuffer<outputData> outputBuf;
+
+int instanceCount;
+
+[numthreads(10,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+	if (id.x < instanceCount)
+	{
+		instanceData datum = instanceBuf[id.x];
+		float3 dir = datum.direction;
+		float3 pos = datum.position;
+		float3 up = float3(0, 1, 0);
+		float3 xaxis = normalize(cross(up, dir));
+		float3 yaxis = normalize(cross(dir, xaxis));
+		xaxis = xaxis;
+		yaxis = yaxis;
+		dir =   dir;
+		/*float4x4 result = float4x4(xaxis.x, xaxis.y, xaxis.z, pos.x,
+								   yaxis.x, yaxis.y, yaxis.z, pos.y,
+									 dir.x,   dir.y,   dir.z, pos.z,
+								         0,       0,       0,     1 );*/
+		float4x4 result = float4x4(xaxis.x, yaxis.x, dir.x, pos.x,
+								   xaxis.y, yaxis.y, dir.y, pos.y,
+								   xaxis.z, yaxis.z, dir.z, pos.z,
+									     0,       0,     0,     1);
+		outputData resultStruct;
+		resultStruct.transformationMat = result;
+		outputBuf[id.x] = resultStruct;
+	}
+}

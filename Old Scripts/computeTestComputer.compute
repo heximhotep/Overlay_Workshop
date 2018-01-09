@@ -1,0 +1,27 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+RWBuffer<float> vals;
+RWBuffer<float> outbuf;
+
+int count;
+
+
+
+[numthreads(256,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+	int i = 1;
+	int n = ceil(log2(count)) + 1;
+	while(i < n)
+	{
+		int threadCheck = id.x % (pow(2, i));
+		if(threadCheck == 0 && id.x + pow(2, i - 1) < count)
+		{
+			vals[id.x] += vals[id.x + pow(2, i - 1)];
+		}
+		i += 1;
+	}
+	if(id.x == 0)
+		outbuf[0] = vals[0];
+}

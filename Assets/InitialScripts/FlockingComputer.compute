@@ -1,0 +1,31 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel AgentStep BuildTree
+
+struct Agent{
+	float3 position;
+	float3 velocity;
+	float3 acceleration;
+	ushort treeIndex;
+};
+
+struct TreeNode{
+	int leftID;
+	int rightID;
+	int agentID;
+};
+
+TreeNode[] nodeTree;
+RWStructuredBuffer<Agent> Agents;
+
+[numthreads(10,1,1)]
+void AgentStep (uint3 id : SV_DispatchThreadID)
+{
+	Agent agent = Agents[id.x];
+	agent.velocity += agent.acceleration;
+	agent.position += agent.velocity;
+	agent.acceleration = 0;
+}
+
+[numthreads(10,1,1)]
+{
+}

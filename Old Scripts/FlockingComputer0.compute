@@ -1,0 +1,45 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel UpdateAgents
+#pragma kernel CheckRanges
+
+struct Agent{
+	float3 position;
+	float3 velocity;
+	float3 acceleration;
+};
+
+struct RangeCheck{
+	int id1;
+	int id2;
+	float3 position1;
+	float3 position2;
+	float distance;
+};
+
+RWStructuredBuffer<Agent> AgentBuffer;
+RWStructuredBuffer<RangeCheck> CheckBuffer;
+
+float maxSpeed;
+float maxAcceleration;
+float changeRatio;
+
+[numthreads(50,1,1)]
+void UpdateAgents(uint3 id : SV_DispatchThreadID)
+{
+	Agent agent = AgentBuffer[id.x];
+	if(length(agent.acceleration) > maxAcceleration)
+		agent.acceleration = normalize(agent.acceleration) * maxAcceleration;
+	agent.velocity += agent.acceleration;
+	if(length(agent.velocity) > maxSpeed)
+		agent.velocity = normalize(agent.velocity) * maxSpeed;
+	agent.position += agent.velocity;
+	AgentBuffer[id.x] = agent;
+}
+
+[numthreads(50,1,1)]
+void CheckRanges(uint3 id : SV_DispatchThreadID)
+{
+	RangeCheck check = CheckBuffer[id.x];
+	check.distance = length(check.position1 - check.position2);
+	CheckBuffer[id.x] = check;
+}

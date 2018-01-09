@@ -1,0 +1,26 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+struct RangeCheck{
+	int p1_id;
+	int p2_id;
+	float3 pos1;
+	float3 pos2;
+	int inRange;
+};
+
+float MaxDist;
+
+RWStructuredBuffer<RangeCheck> RangeBuffer;
+
+[numthreads(10,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+	RangeCheck check = RangeBuffer[id.x];
+	float3 diff = check.pos1 - check.pos2;
+	if (length(diff) <= MaxDist)
+		check.inRange = 1;
+	else
+		check.inRange = length(diff);
+	RangeBuffer[id.x] = check;
+}
